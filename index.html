@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>3D Model Viewer</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #ffffff; overflow: hidden; }
+    canvas { display: block; }
+    #rotate {
+      position: fixed; left: 16px; bottom: 16px;
+      padding: 8px 14px; border-radius: 999px;
+      border: 1px solid #d9d6d1; background: rgba(255,255,255,0.92);
+      font: 500 13px system-ui, sans-serif; color: #333; cursor: pointer;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    }
+    #rotate:hover { background: #f4f2ef; }
+    #rotate[aria-pressed="false"] { color: #888; }
+    #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #999; font: 14px system-ui, sans-serif; pointer-events: none; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="loading">Loading model…</div>
+  <button id="rotate" aria-pressed="true">Auto-rotate: On</button>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+    // ---- Look settings ----
+    const MODEL_URL = 'model2.glb';
+    const MODEL_COLOR = 0xeceae6;   // one color for everything (soft warm white)
+    const BACKGROUND = 0xffffff;
+    const AO_STRENGTH = 0.9;        // corner darkening, 0–1
+    const SHADOW_OPACITY = 0.16;    // soft shadow under the model, 0–1
+    const GLASS_COLOR = 0xc8d5dd;   // cool glass tint
+    const GLASS_OPACITY = 0.7;      // 0 = invisible, 1 = solid
+    const DOOR_OPACITY = 0.7;       // doors: 0 = invisible, 1 = solid
+
+    // ---- Renderer / scene / camera ----
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.VSMShadowMap;   // very soft shadow edges
+    renderer.shadowMap.autoUpdate = false;           // model and light don't move: compute shadows once
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(BACKGROUND);
+
+    // Lighting: soft sky fill + one main light from the side so each wall face gets its own tone
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    scene.environmentIntensity = 0.35;
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x8c8a86, 0.9));
+    const sun = new THREE.DirectionalLight(0xfffaf2, 1.8);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.radius = 12;
+    sun.shadow.blurSamples = 16;
+    sun.shadow.bias = -0.0005;
+    scene.add(sun, sun.target);
+
+    const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.01, 1000);
+
+    // ---- Controls: drag = orbit, wheel = zoom, right-drag = pan ----
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;    // short, firm glide on rotate (zoom has no glide)
+    controls.dampingFactor = 0.25;
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 1.0;   // slow
+
+    // ---- Post-processing: ambient occlusion for soft corner shading ----
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    const aoPass = new GTAOPass(scene, camera, window.innerWidth, window.innerHeight);
+    aoPass.blendIntensity = AO_STRENGTH;
+    composer.addPass(aoPass);
+    // Keep glass out of the corner-shading pass so it stays clean
+    const baseOverride = aoPass.overrideVisibility.bind(aoPass);
+    aoPass.overrideVisibility = () => {
+      baseOverride();
+      scene.traverse((o) => { if (o.userData.isGlass) o.visible = false; });
+    };
+    composer.addPass(new OutputPass());
+
+    // ---- Load model ----
+    const material = new THREE.MeshStandardMaterial({ color: MODEL_COLOR, roughness: 0.95, metalness: 0, side: THREE.DoubleSide });
+    const lineMaterial = new THREE.LineBasicMaterial({ color: 0xb5b2ad });
+    const glassMaterial = new THREE.MeshStandardMaterial({
+      color: GLASS_COLOR, roughness: 0.15, metalness: 0, side: THREE.DoubleSide,
+      transparent: true, opacity: GLASS_OPACITY, depthWrite: false,
+    });
+    const doorMaterial = new THREE.MeshStandardMaterial({
+      color: MODEL_COLOR, roughness: 0.95, metalness: 0, side: THREE.DoubleSide,
+      transparent: true, opacity: DOOR_OPACITY, depthWrite: false,
+    });
+    // Doors = the purple door layer in the Rhino export
+    const isDoor = (m) => m && m.color && m.color.getHex() !== 0xffffff && m.opacity === 1 &&
+      m.color.r > m.color.g * 3 && m.color.b > m.color.g * 3;   // purple / violet
+
+    // Some objects (e.g. the coffee table) export inside-out: every face points toward the object's center.
+    // Flip only those (at least 90% of faces pointing inward), so ordinary walls and panels are untouched.
+    function fixInsideOut(geometry) {
+      const pos = geometry.attributes.position;
+      const idx = geometry.index;
+      const count = idx ? idx.count : pos.count;
+      if (count < 12) return;   // single panels can't be inside-out
+      geometry.computeBoundingBox();
+      const center = geometry.boundingBox.getCenter(new THREE.Vector3());
+      const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+      const n = new THREE.Vector3(), e = new THREE.Vector3(), m = new THREE.Vector3();
+      let inward = 0, total = 0;
+      for (let i = 0; i < count; i += 3) {
+        const ia = idx ? idx.getX(i) : i, ib = idx ? idx.getX(i + 1) : i + 1, ic = idx ? idx.getX(i + 2) : i + 2;
+        a.fromBufferAttribute(pos, ia); b.fromBufferAttribute(pos, ib); c.fromBufferAttribute(pos, ic);
+        n.subVectors(b, a).cross(e.subVectors(c, a));
+        if (n.lengthSq() === 0) continue;
+        m.copy(a).add(b).add(c).divideScalar(3).sub(center);
+        total++;
+        if (n.dot(m) < 0) inward++;
+      }
+      if (!total || inward / total < 0.9) return;
+      if (idx) {
+        for (let i = 0; i < idx.count; i += 3) { const t = idx.getX(i + 1); idx.setX(i + 1, idx.getX(i + 2)); idx.setX(i + 2, t); }
+        idx.needsUpdate = true;
+      } else {
+        for (let i = 0; i < pos.count; i += 3) {
+          for (let k = 0; k < 3; k++) { const t = pos.getComponent(i + 1, k); pos.setComponent(i + 1, k, pos.getComponent(i + 2, k)); pos.setComponent(i + 2, k, t); }
+        }
+        pos.needsUpdate = true;
+      }
+      const nor = geometry.attributes.normal;
+      if (nor) { for (let i = 0; i < nor.count; i++) nor.setXYZ(i, -nor.getX(i), -nor.getY(i), -nor.getZ(i)); nor.needsUpdate = true; }
+    }
+
+    // Glass = the Rhino glass layer: a semi-transparent material that isn't the white walls
+    // (older exports used solid black for glass, so that still counts too)
+    const isGlass = (m) => {
+      if (!m || !m.color) return false;
+      const hex = m.color.getHex();
+      if (m.opacity < 1 && hex !== 0xffffff) return true;
+      return hex === 0x000000 && m.opacity === 1;
+    };
+
+    new GLTFLoader().load(MODEL_URL, (gltf) => {
+      const model = gltf.scene;
+
+      model.traverse((obj) => {
+        if (obj.isMesh) fixInsideOut(obj.geometry);
+        if (obj.isMesh && isDoor(obj.material)) {
+          obj.material = doorMaterial;
+          obj.userData.isGlass = true;   // keep doors out of the corner-shading pass, like glass
+          obj.renderOrder = 1;
+        } else if (obj.isMesh && isGlass(obj.material)) {
+          obj.material = glassMaterial;
+          obj.userData.isGlass = true;
+          obj.renderOrder = 1;
+        } else if (obj.isMesh) {
+          obj.material = material;   // everything else: one color, fully solid
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+        } else if (obj.isLine) {
+          obj.material = lineMaterial;
+        }
+      });
+
+      // Center on origin, resting on y = 0
+      const box = new THREE.Box3().setFromObject(model);
+      const center = box.getCenter(new THREE.Vector3());
+      model.position.sub(new THREE.Vector3(center.x, box.min.y, center.z));
+      scene.add(model);
+      const size = box.getSize(new THREE.Vector3());
+      const radius = size.length() / 2;
+
+      // Soft shadow on an invisible ground
+      const ground = new THREE.Mesh(new THREE.PlaneGeometry(radius * 10, radius * 10), new THREE.ShadowMaterial({ opacity: SHADOW_OPACITY }));
+      ground.rotation.x = -Math.PI / 2;
+      ground.position.y = -0.002;
+      ground.receiveShadow = true;
+      scene.add(ground);
+
+      // Main light position and shadow area
+      sun.position.set(radius * 1.4, radius * 2.4, radius * 0.9);
+      const sc = sun.shadow.camera;
+      sc.left = sc.bottom = -radius * 1.4;
+      sc.right = sc.top = radius * 1.4;
+      sc.near = 0.01;
+      sc.far = radius * 8;
+      sc.updateProjectionMatrix();
+
+      // Ambient occlusion scaled to the model
+      aoPass.updateGtaoMaterial({ radius: radius * 0.1, distanceExponent: 1.3, thickness: radius * 0.1, scale: 1.6, samples: 16 });
+      aoPass.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 8, rings: 3, samples: 16 });
+      renderer.shadowMap.needsUpdate = true;   // draw the shadows once, now that the model is in place
+
+      // Frame the camera
+      const target = new THREE.Vector3(0, size.y / 2, 0);
+      controls.target.copy(target);
+      const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 0.9;
+      camera.position.copy(target).add(new THREE.Vector3(1, 1.1, 1.2).normalize().multiplyScalar(dist));
+      camera.near = radius / 100;
+      camera.far = radius * 50;
+      camera.updateProjectionMatrix();
+      controls.update();
+
+      document.getElementById('loading').remove();
+    }, undefined, (err) => {
+      document.getElementById('loading').textContent = 'Could not load ' + MODEL_URL;
+      console.error(err);
+    });
+
+    // ---- Auto-rotate on/off button ----
+    const rotateBtn = document.getElementById('rotate');
+    rotateBtn.addEventListener('click', () => {
+      controls.autoRotate = !controls.autoRotate;
+      rotateBtn.setAttribute('aria-pressed', controls.autoRotate);
+      rotateBtn.textContent = 'Auto-rotate: ' + (controls.autoRotate ? 'On' : 'Off');
+    });
+
+    // ---- Resize + render loop ----
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      composer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    renderer.setAnimationLoop(() => {
+      controls.update();
+      composer.render();
+    });
+  </script>
+</body>
+</html>
